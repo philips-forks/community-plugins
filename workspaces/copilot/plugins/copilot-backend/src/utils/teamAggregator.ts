@@ -316,11 +316,10 @@ export function aggregateTeamMetrics(
       entity_id: entityId,
       team_slug: teamSlug,
       daily_active_users: activeUsers.size,
-      // For team-level aggregates, we don't have rolling window data.
-      // V2UserMetricRow only contains daily metrics; per-user weekly/monthly
-      // aggregates are not available from the GitHub Copilot Metrics API.
-      // The UI should handle undefined weekly/monthly values gracefully
-      // (e.g., by not rendering weekly charts for team-scoped views).
+      // Weekly and monthly active user counts are not available directly from
+      // the GitHub Copilot Metrics API for team-level data.  They are computed
+      // as rolling 7-day and 28-day windows at read time by DatabaseHandlerV2
+      // using the stored per-user activity records.
       weekly_active_users: undefined,
       monthly_active_users: undefined,
       monthly_active_agent_users: agentUsers,

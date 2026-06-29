@@ -19,6 +19,7 @@ import { Knex } from 'knex';
 import {
   V2DailyTotal,
   V2IngestionLogRow,
+  V2UserMetricRow,
   V2UserTeamRow,
 } from '@backstage-community/plugin-copilot-common';
 import { migrationsDir } from './DatabaseHandler';
@@ -341,6 +342,125 @@ describe('DatabaseHandlerV2', () => {
       expect(result).toHaveProperty('prMetrics');
       expect(result.daily).toHaveLength(2);
     });
+
+    it('getDailyTotals computes rolling weekly/monthly active users for teams', async () => {
+      const D1 = '2026-05-01'; // May 1
+      const D7 = '2026-05-07'; // May 7  (D1 + 6 days, last day of D1's weekly window)
+      const D8 = '2026-05-08'; // May 8  (D1 + 7 days, first day outside D1's weekly window)
+
+      // Insert user-team memberships:
+      //   D1: users 1 and 2 are in team 'alpha'
+      //   D7: users 2 and 3 are in team 'alpha'
+      //   D8: users 3 and 4 are in team 'alpha'
+      await handler.insertUserTeams([
+        buildUserTeam({
+          day: D1,
+          user_id: 1,
+          user_login: 'u1',
+          team_slug: 'alpha',
+        }),
+        buildUserTeam({
+          day: D1,
+          user_id: 2,
+          user_login: 'u2',
+          team_slug: 'alpha',
+        }),
+        buildUserTeam({
+          day: D7,
+          user_id: 2,
+          user_login: 'u2',
+          team_slug: 'alpha',
+        }),
+        buildUserTeam({
+          day: D7,
+          user_id: 3,
+          user_login: 'u3',
+          team_slug: 'alpha',
+        }),
+        buildUserTeam({
+          day: D8,
+          user_id: 3,
+          user_login: 'u3',
+          team_slug: 'alpha',
+        }),
+        buildUserTeam({
+          day: D8,
+          user_id: 4,
+          user_login: 'u4',
+          team_slug: 'alpha',
+        }),
+      ]);
+
+      // Insert user metrics (daily activity):
+      //   D1: user 1 is active
+      //   D7: users 2 and 3 are active
+      //   D8: user 4 is active
+      await handler.insertUserMetrics([
+        buildUserMetric({ day: D1, user_id: 1, user_login: 'u1' }),
+        buildUserMetric({ day: D7, user_id: 2, user_login: 'u2' }),
+        buildUserMetric({ day: D7, user_id: 3, user_login: 'u3' }),
+        buildUserMetric({ day: D8, user_id: 4, user_login: 'u4' }),
+      ]);
+
+      // Insert daily totals for team 'alpha' with null weekly/monthly values
+      // (as stored by the ingestion pipeline — rolling windows are not from the API)
+      await handler.insertDailyTotals([
+        buildDailyTotal({
+          day: D1,
+          team_slug: 'alpha',
+          daily_active_users: 1,
+          weekly_active_users: undefined,
+          monthly_active_users: undefined,
+        }),
+        buildDailyTotal({
+          day: D7,
+          team_slug: 'alpha',
+          daily_active_users: 2,
+          weekly_active_users: undefined,
+          monthly_active_users: undefined,
+        }),
+        buildDailyTotal({
+          day: D8,
+          team_slug: 'alpha',
+          daily_active_users: 1,
+          weekly_active_users: undefined,
+          monthly_active_users: undefined,
+        }),
+      ]);
+
+      const rows = await handler.getDailyTotals(
+        'organization',
+        'org-1',
+        D1,
+        D8,
+        'alpha',
+      );
+
+      expect(rows).toHaveLength(3);
+
+      // D1 – weekly window [Apr 25, May 1]: only D1 has data
+      //   D1 team ∩ D1 active = {1,2} ∩ {1} = {1}  → weekly = 1
+      //   monthly window [Apr 3, May 1]: same days in range → monthly = 1
+      expect(rows[0].weekly_active_users).toBe(1);
+      expect(rows[0].monthly_active_users).toBe(1);
+
+      // D7 – weekly window [May 1, May 7]:
+      //   D1 team ∩ D1 active = {1,2} ∩ {1} = {1}
+      //   D7 team ∩ D7 active = {2,3} ∩ {2,3} = {2,3}
+      //   union → {1,2,3}  → weekly = 3
+      //   monthly window [Apr 9, May 7]: same days fall in range → monthly = 3
+      expect(rows[1].weekly_active_users).toBe(3);
+      expect(rows[1].monthly_active_users).toBe(3);
+
+      // D8 – weekly window [May 2, May 8]:
+      //   D7 team ∩ D7 active = {2,3} ∩ {2,3} = {2,3}
+      //   D8 team ∩ D8 active = {3,4} ∩ {4} = {4}
+      //   union → {2,3,4}  → weekly = 3
+      //   monthly window [Apr 10, May 8]: D1 also falls in window
+      //   D1 team ∩ D1 active = {1}  → union → {1,2,3,4} → monthly = 4
+      expect(rows[2].weekly_active_users).toBe(3);
+      expect(rows[2].monthly_active_users).toBe(4);
+    });
   });
 });
 
@@ -398,6 +518,29 @@ function buildUserTeam(overrides: Partial<V2UserTeamRow> = {}): V2UserTeamRow {
     user_login: 'octocat',
     team_id: 100,
     team_slug: 'alpha',
+    ...overrides,
+  };
+}
+
+function buildUserMetric(
+  overrides: Partial<V2UserMetricRow> = {},
+): V2UserMetricRow {
+  return {
+    day: '2026-05-01',
+    metrics_type: 'organization',
+    entity_id: 'org-1',
+    user_id: 1,
+    user_login: 'octocat',
+    used_agent: false,
+    used_chat: false,
+    used_cli: true,
+    code_acceptance_activity_count: 1,
+    code_generation_activity_count: 2,
+    loc_added_sum: 10,
+    loc_deleted_sum: 3,
+    loc_suggested_to_add_sum: 12,
+    loc_suggested_to_delete_sum: 4,
+    user_initiated_interaction_count: 5,
     ...overrides,
   };
 }

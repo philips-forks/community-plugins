@@ -311,7 +311,121 @@ export class DatabaseHandlerV2 {
 
     query.where('team_slug', teamSlug ?? '');
 
-    return query.orderBy('day', 'asc').select('*');
+    const rows = await query.orderBy('day', 'asc').select('*');
+
+    if (!teamSlug || !rows.length) {
+      return rows;
+    }
+
+    return this.computeRollingWindowsForTeam(
+      rows,
+      metricsType,
+      entityId,
+      teamSlug,
+      from,
+      to,
+    );
+  }
+
+  private async computeRollingWindowsForTeam(
+    rows: V2DailyTotal[],
+    metricsType: MetricsScope,
+    entityId: string,
+    teamSlug: string,
+    from: string,
+    to: string,
+  ): Promise<V2DailyTotal[]> {
+    // Extend the lookback by 27 days to cover the full 28-day monthly window
+    const extendedFrom = DateTime.fromISO(from, { zone: 'utc' })
+      .minus({ days: 27 })
+      .toISODate();
+
+    if (!extendedFrom) {
+      return rows;
+    }
+
+    // Fetch team memberships over the extended window
+    const teamMemberRows = await this.db('copilot_user_teams')
+      .where('metrics_type', metricsType)
+      .where('entity_id', entityId)
+      .where('team_slug', teamSlug)
+      .whereBetween('day', [extendedFrom, to])
+      .select('day', 'user_id');
+
+    // Fetch user activity over the extended window
+    const userActivityRows = await this.db('copilot_user_metrics')
+      .where('metrics_type', metricsType)
+      .where('entity_id', entityId)
+      .whereBetween('day', [extendedFrom, to])
+      .select('day', 'user_id');
+
+    // Build Map<dayStr, Set<userId>> for team members per day
+    const teamMembersByDay = new Map<string, Set<number>>();
+    for (const row of teamMemberRows) {
+      const day = this.normalizeDay(row.day);
+      if (!day) continue;
+      if (!teamMembersByDay.has(day)) {
+        teamMembersByDay.set(day, new Set());
+      }
+      teamMembersByDay.get(day)!.add(Number(row.user_id));
+    }
+
+    // Build Map<dayStr, Set<userId>> for active users per day
+    const activeUsersByDay = new Map<string, Set<number>>();
+    for (const row of userActivityRows) {
+      const day = this.normalizeDay(row.day);
+      if (!day) continue;
+      if (!activeUsersByDay.has(day)) {
+        activeUsersByDay.set(day, new Set());
+      }
+      activeUsersByDay.get(day)!.add(Number(row.user_id));
+    }
+
+    // Build Map<dayStr, Set<userId>> for users who were both in the team AND
+    // active on the same day (used as the unit for rolling window aggregation)
+    const teamActiveByDay = new Map<string, Set<number>>();
+    for (const [day, members] of teamMembersByDay) {
+      const active = activeUsersByDay.get(day) ?? new Set<number>();
+      const teamActive = new Set<number>();
+      for (const uid of members) {
+        if (active.has(uid)) {
+          teamActive.add(uid);
+        }
+      }
+      if (teamActive.size > 0) {
+        teamActiveByDay.set(day, teamActive);
+      }
+    }
+
+    // Compute rolling 7-day (weekly) and 28-day (monthly) active user counts
+    return rows.map(row => {
+      const dayStr = this.normalizeDay(row.day);
+      if (!dayStr) return row;
+
+      const dayDt = DateTime.fromISO(dayStr, { zone: 'utc' });
+      const weekStart = dayDt.minus({ days: 6 }).toISODate();
+      const monthStart = dayDt.minus({ days: 27 }).toISODate();
+
+      if (!weekStart || !monthStart) return row;
+
+      const weeklyUsers = new Set<number>();
+      const monthlyUsers = new Set<number>();
+
+      for (const [actDay, users] of teamActiveByDay) {
+        if (actDay >= weekStart && actDay <= dayStr) {
+          for (const uid of users) weeklyUsers.add(uid);
+        }
+        if (actDay >= monthStart && actDay <= dayStr) {
+          for (const uid of users) monthlyUsers.add(uid);
+        }
+      }
+
+      return {
+        ...row,
+        weekly_active_users: weeklyUsers.size,
+        monthly_active_users: monthlyUsers.size,
+      };
+    });
   }
 
   async getPrMetrics(
